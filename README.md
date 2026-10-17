@@ -123,6 +123,27 @@ You can also set `$SARVAM_API_KEY`.
 Requirements: KDE Plasma 6 on Wayland is the main target. X11 and GNOME work with a plainer pill.
 You also need pipewire, python-evdev, gtk4 and libadwaita.
 
+## uninstall
+
+```sh
+./uninstall.sh            # remove kivi, keep settings, api key, learned words and history
+./uninstall.sh --purge    # remove all of it
+```
+
+This stops and disables the `kivi` service, then removes the `kivi` command, the menu entry, the icons,
+the fonts kivi installed and its runtime files. With `--purge` it also deletes `~/.config/kivi` and
+`~/.local/share/kivi`. Nothing needs `sudo`.
+
+It then prints the system-wide steps to undo by hand, if you did them and nothing else needs them:
+
+```sh
+sudo rm /etc/udev/rules.d/60-kivi-uinput.rules /etc/modules-load.d/uinput.conf && sudo udevadm control --reload
+sudo gpasswd -d $USER input                       # takes effect at next login
+sudo pacman -Rs gtk4-layer-shell wl-clipboard     # optional: other apps may use these
+```
+
+Finally, delete the cloned folder.
+
 ## command line
 
 ```
