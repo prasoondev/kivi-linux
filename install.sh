@@ -23,10 +23,20 @@ chmod +x bin/kivi
 ln -sfn "$REPO/bin/kivi" ~/.local/bin/kivi
 
 install -m 644 data/kivi.svg ~/.local/share/icons/hicolor/scalable/apps/kivi.svg
-gtk-update-icon-cache -q -t ~/.local/share/icons/hicolor 2>/dev/null || true
+# PNG sizes too: some menus and notification servers skip scalable SVGs
+if command -v rsvg-convert >/dev/null; then
+  for s in 16 22 24 32 48 64 128 256 512; do
+    mkdir -p ~/.local/share/icons/hicolor/${s}x${s}/apps
+    rsvg-convert -w $s -h $s data/kivi.svg -o ~/.local/share/icons/hicolor/${s}x${s}/apps/kivi.png
+  done
+fi
+touch ~/.local/share/icons/hicolor
+gtk-update-icon-cache -q -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
 # absolute Exec: ~/.local/bin isn't always on the session PATH
 sed "s|^Exec=kivi |Exec=$HOME/.local/bin/kivi |" data/kivi.desktop > ~/.local/share/applications/ai.kivi.Linux.desktop
 update-desktop-database -q ~/.local/share/applications 2>/dev/null || true
+# KDE caches menu entries and icons in ksycoca; rebuild it so the menu picks up the icon now
+command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
 
 if [ ! -f ~/.config/kivi/config.toml ]; then
   cp config.example.toml ~/.config/kivi/config.toml
