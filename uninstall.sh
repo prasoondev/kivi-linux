@@ -37,5 +37,4 @@ echo "system-wide bits install.sh asked you to add (only if you did, and nothing
 [ -f /etc/udev/rules.d/60-kivi-uinput.rules ] && \
   echo "  sudo rm /etc/udev/rules.d/60-kivi-uinput.rules /etc/modules-load.d/uinput.conf && sudo udevadm control --reload"
 id -nG "$USER" | grep -qw input && echo "  sudo gpasswd -d $USER input"
-echo "  sudo pacman -Rs gtk4-layer-shell wl-clipboard   # optional: other apps may use these"
 echo "then delete this folder: rm -rf \"$(cd "$(dirname "$0")" && pwd)\""

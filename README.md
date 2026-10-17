@@ -139,8 +139,9 @@ It then prints the system-wide steps to undo by hand, if you did them and nothin
 ```sh
 sudo rm /etc/udev/rules.d/60-kivi-uinput.rules /etc/modules-load.d/uinput.conf && sudo udevadm control --reload
 sudo gpasswd -d $USER input                       # takes effect at next login
-sudo pacman -Rs gtk4-layer-shell wl-clipboard     # optional: other apps may use these
 ```
+
+System packages (`gtk4-layer-shell`, `wl-clipboard`, …) are left installed, since other apps may use them.
 
 Finally, delete the cloned folder.
 
