@@ -6,6 +6,7 @@ usage:
   kivi settings                     open the kivi window
   kivi toggle [dictate|agent|command]
                                     start/stop listening (bind this to a shortcut if hotkeys can't work)
+  kivi show | hide                  show the idle pill again, or hide it (it still appears while talking)
   kivi add-word WORD...             teach kivi a name or term it keeps getting wrong
   kivi words                        list learned words
   kivi test FILE.wav                run speech-to-text + cleanup on a file (types nothing)
@@ -50,6 +51,23 @@ def cmd_toggle(args):
         print("kivi:", reply.get("error", "toggle failed"), file=sys.stderr)
         return 1
     return 0
+
+
+def _overlay(visible):
+    from kivi import ipc
+    reply = ipc.request({"cmd": "overlay", "visible": visible})
+    if reply is None:
+        print(NOT_RUNNING, file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_show(_args):
+    return _overlay(True)
+
+
+def cmd_hide(_args):
+    return _overlay(False)
 
 
 def cmd_add_word(args):
@@ -141,7 +159,8 @@ def usage(error=None):
 
 
 COMMANDS = {
-    "daemon": cmd_daemon, "settings": cmd_settings, "toggle": cmd_toggle, "add-word": cmd_add_word,
+    "daemon": cmd_daemon, "settings": cmd_settings, "toggle": cmd_toggle, "show": cmd_show, "hide": cmd_hide,
+    "add-word": cmd_add_word,
     "words": cmd_words, "test": cmd_test, "status": cmd_status,
 }
 

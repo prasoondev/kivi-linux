@@ -59,6 +59,16 @@ class SarvamError(RuntimeError):
     pass
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib would otherwise forward the api key headers to any host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _post(path, api_key, body, content_type, *, bearer=False):
     if not api_key:
         raise SarvamError("no sarvam api key set")
@@ -67,7 +77,7 @@ def _post(path, api_key, body, content_type, *, bearer=False):
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(API + path, body, headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        with _OPENER.open(req, timeout=TIMEOUT) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
         raw = e.read().decode(errors="replace")

@@ -83,7 +83,7 @@ restore_clipboard = true
 min_hold = 0.35
 hands_free = true          # double-tap dictate shortcut => latched recording until next tap
 history = true
-notify = false             # notifications are a fallback only when overlay unavailable
+notify = false             # notifications when the pill is turned off (always used if the pill can't be shown)
 agent_speak = true         # agent replies are spoken with TTS
 tts_speaker = "shubh"
 tts_language = "en-IN"

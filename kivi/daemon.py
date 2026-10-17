@@ -2,10 +2,13 @@
 
 import logging
 import os
+import queue
 import shutil
 import signal
 import subprocess
 import sys
+import threading
+import time
 
 log = logging.getLogger("kivi")
 
@@ -17,6 +20,11 @@ APP_ID = "ai.kivi.Linux.Daemon"
 
 NO_INPUT_HINT = ("no keyboard access, so hotkeys are off. run `sudo usermod -aG input $USER` and log in again. "
                  "until then: click the pill, or bind `kivi toggle` to a shortcut in system settings.")
+NO_INPUT_SHORT = "no keyboard access · click to talk"
+CAPTURE_TIMEOUT = 120.0  # settings' shortcut dialog pauses hotkeys at most this long
+# engine ui event → tray icon state (the tray holds the error look for a few seconds itself)
+TRAY_STATES = {"listening": "listening", "thinking": "thinking", "heard": "thinking", "speaking": "speaking",
+               "error": "error", "idle": "idle", "done": "idle", "cancelled": "idle"}
 
 
 def _preload_layer_shell():
@@ -36,17 +44,21 @@ def _preload_layer_shell():
 
 
 class Notifier:
-    """notify-send that replaces its previous bubble instead of stacking new ones."""
+    """notify-send that replaces its previous bubble instead of stacking new ones.
+
+    Bubbles are sent from a background thread (notify-send can take seconds) and marked
+    transient, so dictated text doesn't pile up in Plasma's notification history.
+    """
 
     def __init__(self):
         self.ok = bool(shutil.which("notify-send"))
         self.id = None
+        self._q = queue.Queue()
+        self._thread = None
 
-    def show(self, summary, body="", timeout=2500):
-        if not self.ok:
-            return
+    def _send(self, summary, body, timeout):
         cmd = ["notify-send", "-a", "kivi", "-i", "kivi", "-p", "-t", str(timeout),
-               "-h", "string:x-kde-origin-name:kivi"]
+               "-h", "string:x-kde-origin-name:kivi", "-h", "boolean:transient:true"]
         if self.id:
             cmd += ["-r", self.id]
         try:
@@ -54,6 +66,21 @@ class Notifier:
         except (OSError, subprocess.SubprocessError):
             return
         self.id = out.strip() or self.id
+
+    def _worker(self):
+        while True:
+            self._send(*self._q.get())
+
+    def show(self, summary, body="", timeout=2500, wait=False):
+        if not self.ok:
+            return
+        if wait:
+            self._send(summary, body, timeout)
+            return
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._worker, name="kivi-notify", daemon=True)
+            self._thread.start()
+        self._q.put((summary, body, timeout))
 
 
 MODE_LABELS = {"dictate": "listening…", "command": "editing…", "agent": "kivi agent · listening…"}
@@ -72,14 +99,17 @@ class Daemon:
         self.app.connect("activate", lambda _app: None)
         self.app.connect("shutdown", self._shutdown)
         self.overlay = None
+        self.tray = None
         self.engine = None
         self.listener = None
         self.server = None
         self.notifier = Notifier()
         self.paused = False
-        self.held = None          # hotkey action currently driving the engine
+        self.capture_until = 0.0  # settings is recording a new shortcut: hotkeys off until then
+        self.held = None          # (engine run, listener session) of the hotkey take driving the engine
+        self._held_lock = threading.Lock()
+        self._actions = queue.Queue()  # hotkey → engine calls, so the listener thread never blocks
         self.input_ok = False
-        self.overlay_hidden = False
 
     def run(self):
         return self.app.run([sys.argv[0]])
@@ -92,11 +122,22 @@ class Daemon:
         from kivi import desktop, ipc
         from kivi.engine import Engine
 
+        from kivi import config
+
         app.hold()
         for sig in (signal.SIGINT, signal.SIGTERM):
             GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self._on_signal, sig)
+        config.clean_temp()
+        threading.Thread(target=self._action_worker, name="kivi-actions", daemon=True).start()
 
         self._ensure_overlay()
+        try:
+            from kivi.tray import Tray
+            self.tray = Tray(self._on_tray)
+            self.tray.set_pill_visible(self._pill_shown())
+        except Exception as ex:
+            self.tray = None
+            log.warning("tray icon unavailable: %s", ex)
         try:
             self.engine = Engine(self.cfg, self._ui)
         except Exception as ex:
@@ -140,6 +181,8 @@ class Daemon:
             self._ui("error", {"message": f"hotkeys off: {ex}"})
 
     def _shutdown(self, _app):
+        if self.tray is not None:
+            self.tray.close()
         for stop in (getattr(self.listener, "stop", None), getattr(self.server, "stop", None)):
             if stop:
                 try:
@@ -152,7 +195,7 @@ class Daemon:
         except Exception:
             pass
         if self.notifier.id:  # don't leave a stale "listening…" bubble behind
-            self.notifier.show("kivi", "stopped", 1)
+            self.notifier.show("kivi", "stopped", 1, wait=True)
         log.info("kivi stopped")
 
     def _on_signal(self, sig):
@@ -177,24 +220,37 @@ class Daemon:
             log.error("pill unavailable, using notifications: %s", ex)
 
     def _overlay_cfg(self):
-        cfg = dict(self.cfg, overlay=dict(self.cfg["overlay"]))
-        if self.overlay_hidden:
-            cfg["overlay"]["idle"] = "hidden"
-        return cfg
+        return dict(self.cfg, overlay=dict(self.cfg["overlay"]))
 
     def _overlay_live(self):
         return self.overlay is not None and self.cfg["overlay"].get("enabled", True)
+
+    def _want_notifications(self):
+        """Notifications stand in for the pill only when it can't be seen.
+
+        Pill working: never. Pill turned off by the user: if "notifications" is on.
+        Pill wanted but broken (no layer-shell/KWin): always, or kivi would be invisible.
+        """
+        if self._overlay_live() and getattr(self.overlay, "available", True):
+            return False
+        if not self.cfg["overlay"].get("enabled", True):
+            return bool(self.cfg.get("notify"))
+        return True
 
     def _ui(self, event, data):
         """Engine → overlay (thread-safe) plus notification fallback. Called from any thread."""
         if event == "error":
             log.error("%s", data.get("message", ""))
+        if self.tray is not None and event in TRAY_STATES:
+            self.tray.set_state(TRAY_STATES[event])
         if self._overlay_live():
             try:
                 self.overlay.handle(event, data)
             except Exception as ex:
                 log.error("overlay: %s", ex)
-        if not self._overlay_live() or not getattr(self.overlay, "available", True) or self.cfg.get("notify"):
+        if event in ("thinking", "idle", "cancelled"):
+            self._check_held()
+        if event != "level" and self._want_notifications():
             self._notify(event, data)
 
     def _notify(self, event, data):
@@ -215,14 +271,34 @@ class Daemon:
     def _push_status(self):
         """Extra overlay event (ignored by overlays that don't know it): pause state + tooltip hint."""
         if self._overlay_live():
-            hint = "" if self.input_ok else NO_INPUT_HINT
+            hint = "" if self.input_ok else NO_INPUT_SHORT
+            tip = "" if self.input_ok else NO_INPUT_HINT
             try:
-                self.overlay.handle("status", {"paused": self.paused, "input": self.input_ok, "hint": hint})
+                self.overlay.handle("status", {"paused": self.paused, "input": self.input_ok, "hint": hint,
+                                               "tooltip": tip})
             except Exception as ex:
                 log.debug("overlay status: %s", ex)
 
     def _on_click(self):
         self.engine.toggle("agent")
+
+    def _on_tray(self, key):
+        """Tray icon actions; runs on the GLib main loop."""
+        if key in ("agent", "dictate"):
+            if self.engine is not None and not self.paused:
+                self.engine.toggle(key)
+        elif key == "settings":
+            self.spawn_settings()
+        elif key in ("pause", "resume"):
+            self.set_paused(key == "pause")
+        elif key in ("pill-show", "pill-hide"):
+            self.set_overlay_visible(key == "pill-show")
+        elif key == "quit":
+            self.quit()
+
+    def _pill_shown(self):
+        ov = self.cfg["overlay"]
+        return bool(ov.get("enabled", True)) and ov.get("idle", "pill") != "hidden"
 
     def _on_menu(self, item):
         item = item.lower().strip()
@@ -243,53 +319,138 @@ class Daemon:
         else:
             log.warning("unknown menu item %r", item)
 
-    # ------------------------------------------------------------ hotkeys (listener thread)
+    # ------------------------------------------------------------ hotkeys
+    # The listener thread only queues work; _action_worker talks to the engine. A take is
+    # identified by (engine run, listener session) so a release never ends a recording that
+    # the hotkey didn't start (pill click, kivi toggle), and a take the engine ended on its own
+    # (29 s limit, mic error, click) is dropped from the listener too.
 
-    def _on_start(self, action):
-        if self.paused or self.engine is None:
+    def _hotkeys_off(self):
+        return self.paused or self.engine is None or time.monotonic() < self.capture_until
+
+    def _on_start(self, action, session):
+        if self._hotkeys_off():
+            self.listener.cancel_session(session)
             return
-        self.held = action
-        self.engine.start(action)
+        self._actions.put(("start", action, session, False))
 
-    def _on_change(self, action):
-        if self.held is not None:
-            self.held = action
-            self.engine.change(action)
+    def _on_change(self, action, session):
+        self._actions.put(("change", action, session, False))
 
-    def _on_end(self, action, cancelled):
-        if self.held is None:
+    def _on_end(self, action, cancelled, session):
+        self._actions.put(("end", action, session, cancelled))
+
+    def _action_worker(self):
+        while True:
+            kind, action, session, cancelled = self._actions.get()
+            try:
+                self._do_action(kind, action, session, cancelled)
+            except Exception as ex:
+                log.error("hotkey action %s failed: %s", kind, ex)
+
+    def _do_action(self, kind, action, session, cancelled):
+        if kind == "start":
+            run = self.engine.start(action)
+            if run is None:  # engine busy or the mic failed: this take drives nothing
+                if self.listener is not None:
+                    self.listener.cancel_session(session)
+                return
+            with self._held_lock:
+                self.held = (run, session)
+            self._check_held()  # it may already be over (mic died instantly)
             return
-        self.held = None
-        self.engine.end(action, cancelled)
+        with self._held_lock:
+            held = self.held
+            if held is None or held[1] != session:
+                return
+            if kind == "end":
+                self.held = None
+        if kind == "change":
+            self.engine.change(action, token=held[0])
+        else:
+            self.engine.end(action, cancelled, token=held[0])
+
+    def _check_held(self):
+        """Release the hotkey take if the engine is no longer recording it."""
+        with self._held_lock:
+            held = self.held
+            if held is None:
+                return
+            if self.engine is not None and self.engine.state == "listening" and self.engine.run == held[0]:
+                return
+            self.held = None
+        if self.listener is not None:
+            self.listener.cancel_session(held[1])
+
+    def _drop_held(self):
+        with self._held_lock:
+            held, self.held = self.held, None
+        if held is not None:
+            if self.listener is not None:
+                self.listener.cancel_session(held[1])
+            self.engine.end(None, True, token=held[0])
 
     # ------------------------------------------------------------ actions
 
     def set_paused(self, paused):
         self.paused = paused
-        held, self.held = self.held, None
-        if paused and held is not None:
-            self.engine.end(held, True)
+        if paused:
+            self._drop_held()
         log.info("hotkeys %s", "paused" if paused else "resumed")
         self._push_status()
+        if self.tray is not None:
+            self.tray.set_paused(paused)
+
+    def set_capturing(self, active):
+        """Settings is recording a new shortcut: keep the live hotkeys from firing meanwhile."""
+        self.capture_until = time.monotonic() + CAPTURE_TIMEOUT if active else 0.0
+        if active:
+            self._drop_held()
 
     def set_overlay_visible(self, visible):
-        """Runtime only: a hidden pill still appears while kivi is listening or replying."""
-        self.overlay_hidden = not visible
+        """"hide pill" / "show pill" / kivi show|hide. Saved as overlay.idle, so the settings
+        "when idle" option (or a restart) shows the same thing; active states always show."""
+        from kivi import config
+
+        patch = {"overlay": {"idle": "pill" if visible else "hidden"}}
+        if visible:
+            patch["overlay"]["enabled"] = True
+        try:
+            self.cfg = config.update_config(patch)
+        except Exception as ex:  # read-only config: still apply it for this session
+            log.error("could not save the pill setting: %s", ex)
+            self.cfg = dict(self.cfg, overlay=dict(self.cfg["overlay"], **patch["overlay"]))
         if visible and self.overlay is None:
-            self.cfg = dict(self.cfg, overlay=dict(self.cfg["overlay"], enabled=True))
             self._ensure_overlay()
         if self.overlay is not None:
             self.overlay.reload(self._overlay_cfg())
+        if self.tray is not None:
+            self.tray.set_pill_visible(visible)
+        return False
 
     def spawn_settings(self):
         cmd = [sys.executable, KIVI_BIN, "settings"]
         if shutil.which("systemd-run"):  # own scope, so restarting the service doesn't kill the window
             cmd = ["systemd-run", "--user", "--scope", "--collect", "--quiet", "--", *cmd]
-        env = {k: v for k, v in os.environ.items() if k not in ("LD_PRELOAD", PRELOAD_GUARD)}
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("LD_PRELOAD", PRELOAD_GUARD, "XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID")}
+        token = self._activation_token()
+        if token:  # lets KWin raise the window instead of opening it behind the active one
+            env["XDG_ACTIVATION_TOKEN"] = env["DESKTOP_STARTUP_ID"] = token
         try:
             subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, start_new_session=True)
         except OSError as ex:
             log.error("could not open settings: %s", ex)
+
+    @staticmethod
+    def _activation_token():
+        try:
+            from gi.repository import Gdk
+            ctx = Gdk.Display.get_default().get_app_launch_context()
+            return ctx.get_startup_notify_id(None, []) or None
+        except Exception as ex:
+            log.debug("no activation token: %s", ex)
+            return None
 
     def reload(self):
         from kivi import config
@@ -306,6 +467,8 @@ class Daemon:
         self._ensure_overlay()
         if self.overlay is not None:
             self.overlay.reload(self._overlay_cfg())
+        if self.tray is not None:
+            self.tray.set_pill_visible(self._pill_shown())
         self._push_status()
         log.info("config reloaded")
         return False
@@ -337,6 +500,12 @@ class Daemon:
             return {"ok": True, "state": self.engine.state}
         if cmd == "overlay":
             GLib.idle_add(self.set_overlay_visible, bool(msg.get("visible", True)))
+            return {"ok": True}
+        if cmd == "capture":
+            self.set_capturing(bool(msg.get("active", False)))
+            return {"ok": True}
+        if cmd == "pause":
+            GLib.idle_add(lambda: (self.set_paused(bool(msg.get("paused", True))), False)[1])
             return {"ok": True}
         if cmd == "quit":
             self.quit()

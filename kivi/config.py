@@ -6,6 +6,7 @@ Paths can be redirected for tests with KIVI_CONFIG_DIR / KIVI_DATA_DIR.
 import copy
 import json
 import os
+import stat
 import tempfile
 import time
 import tomllib
@@ -16,8 +17,52 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.toml")
 KEY_PATH = os.path.join(CONFIG_DIR, "api_key")
 WORDS_PATH = os.path.join(CONFIG_DIR, "dictionary.txt")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.jsonl")
-SOCKET_PATH = (os.path.join(os.environ["XDG_RUNTIME_DIR"], "kivi.sock")
-               if os.environ.get("XDG_RUNTIME_DIR") else f"/tmp/kivi-{os.getuid()}.sock")
+
+
+def _private_dir(path):
+    """`path` if it is (or can be made) a directory only we can use, else None."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return None
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return None
+    return path
+
+
+def _runtime_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base and os.path.isdir(base):
+        return base
+    # No XDG_RUNTIME_DIR: a predictable /tmp name is only used if nobody else owns it.
+    return _private_dir(f"/tmp/kivi-{os.getuid()}") or tempfile.mkdtemp(prefix=f"kivi-{os.getuid()}-")
+
+
+RUNTIME_DIR = _runtime_dir()
+SOCKET_PATH = os.path.join(RUNTIME_DIR, "kivi.sock")
+
+
+def temp_dir() -> str:
+    """Private (0700) folder for recordings and speech audio, so they never sit in /tmp."""
+    path = os.path.join(RUNTIME_DIR, "kivi")
+    return _private_dir(path) or RUNTIME_DIR
+
+
+def clean_temp() -> None:
+    """Delete recordings left behind by a daemon that was killed mid-way."""
+    import glob
+    for path in glob.glob(os.path.join(temp_dir(), "kivi-*.wav")):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
 
 DEFAULTS = {
     "language": "unknown",
@@ -28,7 +73,9 @@ DEFAULTS = {
     "agent_model": "sarvam-105b-conversations",
     "style": "",
     "paste_keys": "ctrl+v",
+    "copy_keys": "ctrl+c",
     "restore_clipboard": True,
+    "restore_delay": 0.6,
     "min_hold": 0.35,
     "hands_free": True,
     "history": True,
@@ -142,6 +189,13 @@ def dumps_toml(cfg: dict) -> str:
 
 def save_config(cfg: dict) -> None:
     _atomic_write(CONFIG_PATH, "# kivi settings (written by kivi; api key lives in api_key)\n" + dumps_toml(cfg))
+
+
+def update_config(patch: dict) -> dict:
+    """Merge `patch` into the saved config and write it back; returns the new config."""
+    cfg = _merge(load_config(), patch)
+    save_config({k: v for k, v in cfg.items() if k != "api_key"})
+    return cfg
 
 
 # ---------------------------------------------------------------- api key

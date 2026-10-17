@@ -60,16 +60,26 @@ input_ok=""
 for dev in /dev/input/event*; do
   [ -r "$dev" ] && { input_ok=1; break; }
 done
+# check the group database, not this session: a fresh usermod only shows up in `id` after re-login
 in_group=""
-id -nG | grep -qw input && in_group=1
+getent group input | cut -d: -f4 | tr ',' '\n' | grep -qx "$USER" && in_group=1
+session_group=""
+id -nG | grep -qw input && session_group=1
 uinput_ok=""
 [ -w /dev/uinput ] && uinput_ok=1
+uinput_rule=""
+[ -f /etc/udev/rules.d/60-kivi-uinput.rules ] && uinput_rule=1
 
 fix=""
 [ -n "$pkgs" ] && fix="sudo pacman -S --needed$pkgs"
 if [ -z "$in_group" ]; then
   [ -n "$fix" ] && fix="$fix && "
   fix="${fix}sudo usermod -aG input \$USER"
+fi
+# /dev/uinput is root-only on most distros; this rule lets the input group type through it after reboots
+if [ -z "$uinput_rule" ]; then
+  [ -n "$fix" ] && fix="$fix && "
+  fix="${fix}echo 'KERNEL==\"uinput\", GROUP=\"input\", MODE=\"0660\", OPTIONS+=\"static_node=uinput\"' | sudo tee /etc/udev/rules.d/60-kivi-uinput.rules >/dev/null && echo uinput | sudo tee /etc/modules-load.d/uinput.conf >/dev/null && sudo udevadm control --reload && sudo udevadm trigger /dev/uinput"
 fi
 
 echo
@@ -80,6 +90,10 @@ if [ -n "$fix" ]; then
   echo
   echo "one more step:"
   echo "  $fix"
+fi
+if [ -n "$in_group" ] && [ -z "$session_group" ]; then
+  echo
+  echo "you're in the input group, but this login predates it: log out and back in once to make it stick."
 fi
 if [ -z "$input_ok" ] || [ -z "$uinput_ok" ]; then
   echo

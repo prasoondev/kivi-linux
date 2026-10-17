@@ -10,6 +10,8 @@ agent_model = "sarvam-105b-conversations"
 style = ""                      # persona, e.g. "casual, all lowercase, no full stops"
 
 paste_keys = "ctrl+v"           # "ctrl+shift+v" if you mostly dictate into terminals
+copy_keys = "ctrl+c"            # how command mode copies your selection ("ctrl+shift+c" for terminals)
+restore_delay = 0.6             # seconds to wait before putting your old clipboard back
 restore_clipboard = true
 min_hold = 0.35                 # shorter taps are ignored, so normal right ctrl use keeps working
 hands_free = true               # double-tap the dictate shortcut to keep listening until the next tap

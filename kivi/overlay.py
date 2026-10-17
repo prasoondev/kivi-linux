@@ -136,10 +136,11 @@ def _clip_text(text: str, n: int) -> str:
 
 _KWIN_JS = r"""
 (function () {
-    var CAPTION = %(caption)s, POS = %(pos)s, MARGIN = %(margin)d;
+    var CAPTION = %(caption)s, POS = %(pos)s, MARGIN = %(margin)d, PID = %(pid)d;
     var me = null, prev = null;
 
-    function isMe(w) { return !!w && typeof w.caption === "string" && w.caption.indexOf(CAPTION) === 0; }
+    // exact caption AND kivi's own process: a web page titled "kivi-overlay" must not match
+    function isMe(w) { return !!w && w.caption === CAPTION && w.pid === PID; }
     function targetOutput() {
         var a = workspace.activeWindow;
         if (a && !isMe(a) && a.output) return a.output;
@@ -200,8 +201,11 @@ class KWinPlacer:
 
     def __init__(self):
         self._bus = None
-        self._path = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(),
-                                  f"kivi-overlay-{os.getuid()}.js")
+        try:
+            from .config import RUNTIME_DIR
+        except ImportError:
+            RUNTIME_DIR = tempfile.mkdtemp(prefix="kivi-")
+        self._path = os.path.join(RUNTIME_DIR, f"kivi-overlay-{os.getuid()}.js")
 
     @staticmethod
     def available() -> bool:
@@ -224,9 +228,14 @@ class KWinPlacer:
 
     def load(self, position: str, margin: int) -> bool:
         js = _KWIN_JS % {"caption": f'"{CAPTION}"', "pos": '"top"' if position == "top" else '"bottom"',
-                         "margin": int(margin)}
+                         "margin": int(margin), "pid": os.getpid()}
         try:
-            with open(self._path, "w") as f:
+            try:
+                os.unlink(self._path)
+            except FileNotFoundError:
+                pass
+            fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(js)
             self.unload()
             sid = self._call("/Scripting", "org.kde.kwin.Scripting", "loadScript",
@@ -371,9 +380,9 @@ class Overlay:
         self._set_state(self.state, {}, refresh=True)
         return False
 
-    def _set_hint(self, text):
+    def _set_hint(self, text, tooltip=None):
         self.hint = text
-        self.area.set_tooltip_text(text or None)
+        self.area.set_tooltip_text((tooltip if tooltip is not None else text) or None)
         self._set_state(self.state, {}, refresh=True)
         return False
 
@@ -649,13 +658,16 @@ class Overlay:
             self._set_state("idle", {})
         elif event == "reply":
             self._show_reply(data.get("text", ""), data.get("heard", ""))
-            if self.state != "speaking":
+            if self.state in ("heard", "thinking"):
+                # stay busy: "speaking" (agent voice) or "idle" follows right after
+                self._set_state("thinking", {})
+            elif self.state != "speaking":
                 self._set_state("idle", {})
         elif event in ("listening", "thinking", "heard", "speaking", "done", "error"):
             self._set_state(event, data)
         elif event == "status":   # daemon extra: {"paused", "input", "hint"}
             if "hint" in data and data["hint"] != self.hint:
-                self._set_hint(data.get("hint") or "")
+                self._set_hint(data.get("hint") or "", data.get("tooltip"))
             if "paused" in data and bool(data["paused"]) != self.paused:
                 self._set_paused(bool(data["paused"]))
         elif event == "hint":
@@ -755,7 +767,8 @@ class Overlay:
             if self._hover:
                 text = self.hint or ("kivi is paused · right-click to resume" if self.paused else
                                      f"hold {self._dictate_label} to talk · click for agent")
-                lay = self._layout("hint", text, FONT_BODY, 9.5, Pango.Weight.MEDIUM)
+                lay = self._layout("hint", text, FONT_BODY, 9.5, Pango.Weight.MEDIUM,
+                                   max_w=PILL_MAX_W - (12 + 14 + 9) - 14)
                 self._items = [("bars-small", 12, 14), ("text", 12 + 14 + 9, (lay, "ink-2"))]
                 return 12 + 14 + 9 + self._lw(lay) + 14, 30
             self._items = [("bars-idle", 0, 0)]
@@ -1112,6 +1125,9 @@ def _demo(argv):
         state["ov"] = Overlay(app, cfg, on_click=lambda: print("demo: click"),
                               on_menu=lambda k: (print(f"demo: menu {k}"), k == "quit" and app.quit()))
         print(f"demo: backend={state['ov'].backend}", flush=True)
+        if "--hint" in argv:  # what the pill says when kivi has no keyboard access
+            state["ov"].handle("status", {"hint": "no keyboard access · click to talk",
+                                          "tooltip": "no keyboard access, so hotkeys are off."})
         GLib.timeout_add(600, run, 0)
         if "--seconds" in argv:
             GLib.timeout_add(int(float(argv[argv.index("--seconds") + 1]) * 1000), app.quit)
@@ -1132,4 +1148,4 @@ if __name__ == "__main__":
     if "--demo" in sys.argv[1:]:
         _demo(sys.argv[1:])
     else:
-        print("usage: python3 -m kivi.overlay --demo [--state NAME] [--top] [--no-layer-shell] [--seconds N]")
+        print("usage: python3 -m kivi.overlay --demo [--state NAME] [--top] [--hint] [--no-layer-shell] [--seconds N]")

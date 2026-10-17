@@ -72,7 +72,7 @@ def run_bg(work, done=None):
 # ---------------------------------------------------------------- static data
 
 FALLBACK_DEFAULTS = {
-    "language": "unknown", "cleanup": True, "style": "", "paste_keys": "ctrl+v",
+    "language": "unknown", "cleanup": True, "style": "", "paste_keys": "ctrl+v", "copy_keys": "ctrl+c",
     "restore_clipboard": True, "min_hold": 0.35, "hands_free": True, "history": True,
     "notify": False, "agent_speak": True, "tts_speaker": "shubh", "tts_language": "en-IN",
     "agent_allow_shell": False,
@@ -211,6 +211,16 @@ def _kivi_exe():
 
 def _ipc(msg, timeout=2.0):
     return _safe(getattr(ipc, "request", None), msg, timeout=timeout)
+
+
+def _start_buttons_only_icon():
+    """True if the window-button layout puts nothing but the app icon on the left."""
+    try:
+        layout = Gtk.Settings.get_default().get_property("gtk-decoration-layout") or ""
+    except Exception:
+        return False
+    start = layout.split(":", 1)[0] if ":" in layout else ""
+    return {p.strip() for p in start.split(",") if p.strip()} <= {"icon"}
 
 
 # ---------------------------------------------------------------- css
@@ -785,6 +795,8 @@ class SettingsWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         header.pack_start(brand)
         header.set_title_widget(Gtk.Box())
+        if _start_buttons_only_icon():  # e.g. "icon:minimize,maximize,close": don't show a 2nd logo
+            header.set_show_start_title_buttons(False)
 
         body = vbox(0, margin_top=6)
         body.append(Gtk.ScrolledWindow(child=self.nav, vexpand=True,
@@ -1145,6 +1157,9 @@ class SettingsWindow(Adw.ApplicationWindow):
         b.add(combo_row("paste with", "use ctrl+shift+v if you mostly dictate into terminals",
                         [("ctrl+v", "ctrl + v"), ("ctrl+shift+v", "ctrl + shift + v"), ("shift+insert", "shift + insert")],
                         self.get("paste_keys"), lambda v: self.set("paste_keys", v)))
+        b.add(combo_row("copy with", "how command mode reads your selection; terminals need ctrl+shift+c",
+                        [("ctrl+c", "ctrl + c"), ("ctrl+shift+c", "ctrl + shift + c"), ("ctrl+insert", "ctrl + insert")],
+                        self.get("copy_keys") or "ctrl+c", lambda v: self.set("copy_keys", v)))
         b.add(switch_row("restore clipboard", "put back what you had copied after kivi types",
                          self.get("restore_clipboard"), lambda v: self.set("restore_clipboard", v)))
         box.append(b)
@@ -1173,7 +1188,11 @@ class SettingsWindow(Adw.ApplicationWindow):
     def _capture(self, action, title):
         names = {a: t for a, t, _ in SHORTCUT_ROWS}
         taken = {self.get(f"shortcuts.{a}"): names[a] for a in names if a != action}
-        CaptureDialog(title, lambda combo: self._set_shortcut(action, combo), taken).present(self)
+        dialog = CaptureDialog(title, lambda combo: self._set_shortcut(action, combo), taken)
+        # keep the running daemon's hotkeys quiet while the user presses keys here
+        run_bg(lambda: _ipc({"cmd": "capture", "active": True}, timeout=1.0))
+        dialog.connect("closed", lambda *_: run_bg(lambda: _ipc({"cmd": "capture", "active": False}, timeout=1.0)))
+        dialog.present(self)
 
     def _set_shortcut(self, action, combo):
         self.set(f"shortcuts.{action}", combo)
@@ -1460,11 +1479,12 @@ class SettingsWindow(Adw.ApplicationWindow):
         margin = Adw.SpinRow.new_with_range(0, 200, 2)
         margin.set_title("distance from edge")
         margin.set_subtitle("pixels")
-        margin.set_value(float(self.get("overlay.margin") or 28))
+        saved_margin = self.get("overlay.margin")
+        margin.set_value(float(saved_margin if saved_margin is not None else 28))
         margin.connect("notify::value", lambda r, _p: self.set("overlay.margin", int(r.get_value())))
         pill.add(margin)
-        pill.add(switch_row("notifications", "only used when the pill can't be shown", self.get("notify"),
-                            lambda v: self.set("notify", v)))
+        pill.add(switch_row("notifications", "when the pill is turned off, show progress as desktop notifications",
+                            self.get("notify"), lambda v: self.set("notify", v)))
         box.append(pill)
         return scroller
 

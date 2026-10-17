@@ -57,6 +57,8 @@ class Recorder:
     def __init__(self, on_level: Callable[[float], None] | None = None):
         self.on_level = on_level
         self.on_autostop: Callable[[], None] | None = None
+        self.on_died: Callable[[str], None] | None = None  # recorder process quit by itself
+        self._err = None
         self._proc = None
         self._thread = None
         self._pcm = bytearray()
@@ -74,12 +76,31 @@ class Recorder:
         if self._proc:
             self.cancel()
         self._pcm = bytearray()
-        self._proc = subprocess.Popen(_record_cmd(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        self._err = tempfile.TemporaryFile()
+        self._proc = subprocess.Popen(_record_cmd(), stdout=subprocess.PIPE, stderr=self._err,
                                       stdin=subprocess.DEVNULL)
-        self._thread = threading.Thread(target=self._read, args=(self._proc,), name="kivi-recorder", daemon=True)
+        self._thread = threading.Thread(target=self._read, args=(self._proc, self._err),
+                                        name="kivi-recorder", daemon=True)
         self._thread.start()
 
-    def _read(self, proc):
+    def _read(self, proc, err):
+        try:
+            self._read_loop(proc)
+        finally:
+            if proc is self._proc:  # the recorder exited on its own (not stop()/cancel())
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                why = _tail(err) or f"{os.path.basename(proc.args[0])} exited with code {proc.returncode}"
+                if self.on_died:
+                    threading.Thread(target=self.on_died, args=(why,), daemon=True).start()
+            try:
+                err.close()
+            except OSError:
+                pass
+
+    def _read_loop(self, proc):
         meter = _Meter()
         limit = int(self.max_seconds * BYTES_PER_SEC)
         pending = b""
@@ -128,7 +149,7 @@ class Recorder:
             pcm = bytes(self._pcm)
         if len(pcm) < MIN_SECONDS * BYTES_PER_SEC:
             return None
-        fd, path = tempfile.mkstemp(prefix="kivi-", suffix=".wav")
+        fd, path = tempfile.mkstemp(prefix="kivi-", suffix=".wav", dir=_tmp())
         os.close(fd)
         with wave.open(path, "wb") as w:
             w.setnchannels(1)
@@ -140,6 +161,24 @@ class Recorder:
     def cancel(self) -> None:
         self._halt()
         self._pcm = bytearray()
+
+
+def _tmp():
+    try:
+        from . import config
+        return config.temp_dir()
+    except Exception:
+        return None
+
+
+def _tail(f, limit=160) -> str:
+    """Last line of a recorder's stderr, e.g. "pw-record: no target node"."""
+    try:
+        f.seek(0)
+        lines = [ln.strip() for ln in f.read()[-4096:].decode(errors="replace").splitlines() if ln.strip()]
+    except (OSError, ValueError):
+        return ""
+    return lines[-1][:limit] if lines else ""
 
 
 def _remove_dc(pcm: bytes) -> bytes:
@@ -159,7 +198,7 @@ _players_lock = threading.Lock()
 
 
 def play_wav_bytes(data: bytes) -> subprocess.Popen:
-    fd, path = tempfile.mkstemp(prefix="kivi-say-", suffix=".wav")
+    fd, path = tempfile.mkstemp(prefix="kivi-say-", suffix=".wav", dir=_tmp())
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     cmd = ["pw-play", path] if shutil.which("pw-play") else ["aplay", "-q", path]

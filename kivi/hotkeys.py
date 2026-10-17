@@ -49,7 +49,20 @@ def combo_label(s: str) -> str:
     return " + ".join(out)
 
 
+# Mouse buttons (left .. task): a click while a combo is held means ctrl+click, not dictation.
+_MOUSE_BUTTONS = range(ecodes.BTN_LEFT, ecodes.BTN_TASK + 1)
+_WHEELS = {ecodes.REL_WHEEL, ecodes.REL_HWHEEL, getattr(ecodes, "REL_WHEEL_HI_RES", 11),
+           getattr(ecodes, "REL_HWHEEL_HI_RES", 12)}
+
+
 class HotkeyListener(threading.Thread):
+    """Calls on_start(action, session), on_change(action, session) and on_end(action, cancelled, session).
+
+    Callbacks run on the listener thread and must return quickly (the daemon queues them).
+    `session` identifies one press-and-hold (or hands-free) take; cancel_session(session)
+    drops it without calling on_end, e.g. when the engine stopped that recording itself.
+    """
+
     def __init__(self, shortcuts: dict[str, str], on_start, on_change, on_end, *, min_hold=0.35, hands_free=True):
         super().__init__(name="kivi-hotkeys", daemon=True)
         self.on_start, self.on_change, self.on_end = on_start, on_change, on_end
@@ -62,6 +75,7 @@ class HotkeyListener(threading.Thread):
         self._combos: dict[str, frozenset[int]] = {}
         self._pressed: set[int] = set()
         self._active = None  # action currently held (or latched)
+        self._session = 0
         self._t0 = 0.0
         self._cancelled = False
         self._upgraded = False
@@ -80,6 +94,8 @@ class HotkeyListener(threading.Thread):
             except ValueError as e:
                 errors[action] = str(e)
         with self._lock:
+            if self._active and combos.get(self._active) != self._combos.get(self._active):
+                self._end(True)  # its release would never match the new combo
             self._combos = combos
             self.errors = errors
             if min_hold is not None:
@@ -91,11 +107,22 @@ class HotkeyListener(threading.Thread):
     def stop(self):
         self._stopping.set()
 
+    def cancel_session(self, session):
+        """Forget take `session` (no on_end): the engine already finished or never started it."""
+        with self._lock:
+            if self._active and self._session == session:
+                self._active = None
+                self._latched = self._cancelled = self._upgraded = self._double_candidate = False
+
+    @property
+    def session(self):
+        return self._session
+
     # ------------------------------------------------------------ state machine
 
     def _emit(self, fn, *args):
         try:
-            fn(*args)
+            return fn(*args)
         except Exception as e:
             print(f"kivi: hotkey callback failed: {e!r}")
 
@@ -114,7 +141,7 @@ class HotkeyListener(threading.Thread):
     def _end(self, cancelled):
         action, self._active = self._active, None
         self._latched = False
-        self._emit(self.on_end, action, cancelled)
+        self._emit(self.on_end, action, cancelled, self._session)
 
     def _feed(self, code, value, t):
         if value == 2:  # autorepeat
@@ -124,6 +151,13 @@ class HotkeyListener(threading.Thread):
                 self._press(code, t)
             elif value == 0:
                 self._release(code, t)
+
+    def _pointer(self):
+        """A mouse click or wheel turn: a held combo is ctrl+click / ctrl+scroll, not a dictation."""
+        with self._lock:
+            if self._active and not self._latched:
+                self._cancelled = True
+            self._last_tap_end = None
 
     def _press(self, code, t):
         self._pressed.add(code)
@@ -138,19 +172,20 @@ class HotkeyListener(threading.Thread):
             if upgrade:
                 self._active = upgrade
                 self._upgraded = True
-                self._emit(self.on_change, upgrade)
+                self._emit(self.on_change, upgrade, self._session)
             elif not any(code in c and self._combos.get(self._active, frozenset()) <= c
                          for c in self._combos.values()):
                 self._cancelled = True  # a normal shortcut such as right ctrl + c
             return
         action = self._exact_match()
         if action:
+            self._session += 1
             self._active, self._t0 = action, t
             self._cancelled = self._upgraded = False
             self._double_candidate = (action == "dictate" and self._last_tap_end is not None
                                       and t - self._last_tap_end <= DOUBLE_TAP_GAP)
             self._last_tap_end = None
-            self._emit(self.on_start, action)
+            self._emit(self.on_start, action, self._session)
         elif code not in self._combos.get("dictate", frozenset()):
             self._last_tap_end = None
 
@@ -175,67 +210,146 @@ class HotkeyListener(threading.Thread):
             if self._active and not self._latched:
                 self._end(True)
 
+    def _resync(self, held: set[int], t):
+        """Events were dropped (SYN_DROPPED): replace our idea of held keys with the kernel's."""
+        with self._lock:
+            for code in sorted(self._pressed - held):
+                self._release(code, t)  # a release we missed: handle it as if it just happened
+            self._pressed |= held
+
     # ------------------------------------------------------------ devices
 
     def _wanted_codes(self):
         with self._lock:
             return set().union(*self._combos.values()) if self._combos else set()
 
-    def _scan(self, opened: dict, sel):
+    def _scan(self, opened: dict, pointers: dict, sel):
         wanted = self._wanted_codes()
         for path in list_devices():
-            if path in opened:
+            if path in opened or path in pointers:
                 continue
+            dev = None
             try:
                 dev = InputDevice(path)
-            except OSError:
-                continue
-            keys = set(dev.capabilities().get(ecodes.EV_KEY, []))
-            if dev.name == VIRTUAL_KEYBOARD_NAME or ecodes.KEY_A not in keys or not (wanted & keys or not wanted):
-                dev.close()
-                continue
-            opened[path] = dev
-            sel.register(dev, selectors.EVENT_READ)
+                caps = dev.capabilities()
+                keys = set(caps.get(ecodes.EV_KEY, []))
+                rels = set(caps.get(ecodes.EV_REL, []))
+                if dev.name == VIRTUAL_KEYBOARD_NAME:
+                    dev.close()
+                elif ecodes.KEY_A in keys and (wanted & keys or not wanted):
+                    opened[path] = dev
+                    sel.register(dev, selectors.EVENT_READ)
+                elif ecodes.BTN_LEFT in keys or rels & _WHEELS:
+                    pointers[path] = dev  # read only while a combo is held (see _watch_pointers)
+                else:
+                    dev.close()
+            except OSError:  # device vanished between listing and opening (re-plug, resume, ...)
+                opened.pop(path, None)
+                pointers.pop(path, None)
+                if dev is not None:
+                    try:
+                        sel.unregister(dev)
+                    except (KeyError, ValueError):
+                        pass
+                    try:
+                        dev.close()
+                    except OSError:
+                        pass
         self.devices = sorted({d.name for d in opened.values()})
 
-    def _drop(self, opened, sel, dev):
+    def _drop(self, opened, pointers, sel, dev):
         try:
             sel.unregister(dev)
         except (KeyError, ValueError):
             pass
-        opened.pop(dev.path, None)
+        was_keyboard = opened.pop(dev.path, None) is not None
+        pointers.pop(dev.path, None)
         try:
             dev.close()
         except OSError:
             pass
         self.devices = sorted({d.name for d in opened.values()})
-        self._reset_keys()
+        if was_keyboard:
+            self._reset_keys()
+
+    def _watch_pointers(self, pointers, sel, watching):
+        """Register mice only while a combo is held, so idle mouse motion costs nothing."""
+        want = bool(self._active and not self._latched)
+        if want == watching:
+            return watching
+        for dev in list(pointers.values()):
+            try:
+                if want:
+                    try:
+                        while dev.read_one() is not None:  # drop clicks from before the press
+                            pass
+                    except BlockingIOError:
+                        pass
+                    sel.register(dev, selectors.EVENT_READ)
+                else:
+                    sel.unregister(dev)
+            except (OSError, KeyError, ValueError):
+                pointers.pop(dev.path, None)
+        return want
+
+    def _handle(self, dev, opened, dropped):
+        is_pointer = dev.path not in opened
+        for ev in dev.read():
+            if ev.type == ecodes.EV_SYN:
+                if ev.code == ecodes.SYN_DROPPED:
+                    dropped.add(dev.path)
+                elif ev.code == ecodes.SYN_REPORT and dev.path in dropped:
+                    dropped.discard(dev.path)
+                    held = set()
+                    for d in opened.values():
+                        try:
+                            held |= set(d.active_keys())
+                        except OSError:
+                            pass
+                    self._resync(held, ev.timestamp())
+            elif dev.path in dropped:
+                continue  # events between SYN_DROPPED and the next report are incomplete
+            elif ev.type == ecodes.EV_KEY:
+                if ev.code in _MOUSE_BUTTONS:
+                    if ev.value == 1:
+                        self._pointer()
+                elif not is_pointer:
+                    self._feed(ev.code, ev.value, ev.timestamp())
+            elif ev.type == ecodes.EV_REL and ev.code in _WHEELS:
+                self._pointer()
 
     def run(self):
         sel = selectors.DefaultSelector()
         opened: dict[str, InputDevice] = {}
+        pointers: dict[str, InputDevice] = {}
+        dropped: set[str] = set()
+        watching = False
         next_scan = 0.0
         try:
             while not self._stopping.is_set():
-                now = time.monotonic()
-                if now >= next_scan:
-                    self._scan(opened, sel)
-                    next_scan = now + RESCAN_SECONDS
-                if not opened:
-                    self._stopping.wait(0.5)
-                    continue
-                for key, _ in sel.select(timeout=0.5):
-                    dev = key.fileobj
-                    try:
-                        for ev in dev.read():
-                            if ev.type == ecodes.EV_KEY:
-                                self._feed(ev.code, ev.value, ev.timestamp())
-                    except BlockingIOError:
+                try:
+                    now = time.monotonic()
+                    if now >= next_scan:
+                        self._scan(opened, pointers, sel)
+                        next_scan = now + RESCAN_SECONDS
+                    watching = self._watch_pointers(pointers, sel, watching)
+                    if not opened:
+                        self._stopping.wait(0.5)
                         continue
-                    except OSError:  # unplugged
-                        self._drop(opened, sel, dev)
+                    for key, _ in sel.select(timeout=0.5):
+                        dev = key.fileobj
+                        try:
+                            self._handle(dev, opened, dropped)
+                        except BlockingIOError:
+                            continue
+                        except OSError:  # unplugged
+                            dropped.discard(dev.path)
+                            self._drop(opened, pointers, sel, dev)
+                except Exception as e:  # never let one bad device kill hotkeys for good
+                    print(f"kivi: hotkey listener error: {e!r}")
+                    self._stopping.wait(1.0)
         finally:
-            for dev in list(opened.values()):
+            for dev in [*opened.values(), *pointers.values()]:
                 try:
                     dev.close()
                 except OSError:

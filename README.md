@@ -62,6 +62,19 @@ and **error**.
   </tr>
 </table>
 
+### tray icon
+
+kivi also sits in the system tray (StatusNotifierItem, so it works with Plasma, waybar and GNOME's
+AppIndicator extension). The icon follows what kivi is doing:
+
+<p align="center">
+  <img src="docs/screenshots/tray-states.png" width="420" alt="tray icon states: idle, listening, thinking, speaking, paused, error">
+</p>
+
+From left to right: idle, listening, thinking, speaking, paused, error. Left-click to talk to the agent,
+middle-click to dictate. Right-click for talk to kivi, start dictation, settings, pause/resume,
+hide/show pill, and quit.
+
 ### kivi settings
 
 A GTK4 / libadwaita app for managing kivi. There's no sign-in: you paste your own Sarvam API key and
@@ -116,6 +129,7 @@ You also need pipewire, python-evdev, gtk4 and libadwaita.
 kivi                      run the daemon (the service does this for you)
 kivi settings             open the settings window
 kivi toggle [dictate|agent|command]
+kivi show | hide          bring back (or hide) the idle pill
 kivi add-word WORD        teach kivi a word
 kivi words                list learned words
 kivi test FILE.wav        speech-to-text + cleanup on a file, without typing anything

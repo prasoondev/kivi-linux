@@ -9,6 +9,8 @@ import subprocess
 import threading
 import time
 import uuid
+from typing import NamedTuple
+from urllib.parse import urlsplit
 
 VIRTUAL_KEYBOARD_NAME = "kivi-virtual-keyboard"
 
@@ -25,34 +27,143 @@ def _spawn(cmd):
 
 # ---------------------------------------------------------------- clipboard
 
-class Clipboard:
-    """wl-clipboard if installed, else KDE Klipper over D-Bus, else xclip."""
+# Types we read back as text, best first; wl-paste's "-t text" picks any of them.
+_TEXT_TYPES = ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT")
+# Password managers (KeePassXC, ...) tag secrets with this; kivi never reads or republishes them.
+PASSWORD_HINT = "x-kde-passwordManagerHint"
+_SNAPSHOT_LIMIT = 32 * 1024 * 1024
 
-    def get(self) -> str:
-        if shutil.which("wl-paste"):
-            return _run(["wl-paste", "-n"]).stdout
-        if shutil.which("qdbus6"):
-            return _run(["qdbus6", "org.kde.klipper", "/klipper", "getClipboardContents"]).stdout.removesuffix("\n")
+
+class Snapshot(NamedTuple):
+    """What the clipboard held before kivi used it. mime None = it was empty."""
+    mime: str | None
+    data: bytes = b""
+
+
+def _klipper(method, *args):
+    """Call Klipper over D-Bus in-process (text never goes through a command line)."""
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    params = GLib.Variant("(" + "s" * len(args) + ")", args) if args else None
+    res = bus.call_sync("org.kde.klipper", "/klipper", "org.kde.klipper.klipper", method, params,
+                        None, Gio.DBusCallFlags.NONE, 5000, None)
+    out = res.unpack() if res is not None else ()
+    return out[0] if out else None
+
+
+def _has_klipper():
+    if not shutil.which("qdbus6") and "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+        return False
+    try:
+        import gi  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+class Clipboard:
+    """wl-clipboard if installed, else KDE Klipper over D-Bus, else xclip.
+
+    Text is always handed over on stdin (or D-Bus), never in argv: argv is world-readable in
+    /proc and limited to 128 KiB per argument.
+    """
+
+    def _backend(self):
+        if shutil.which("wl-paste") and shutil.which("wl-copy"):
+            return "wl"
+        if _has_klipper():
+            return "klipper"
         if shutil.which("xclip"):
-            return _run(["xclip", "-o", "-sel", "clip"]).stdout
+            return "xclip"
         raise RuntimeError("no clipboard tool: install wl-clipboard")
 
+    def types(self) -> list[str]:
+        """MIME types currently offered ([] if empty or unknown)."""
+        if self._backend() != "wl":
+            return []
+        p = subprocess.run(["wl-paste", "-l"], capture_output=True, text=True, timeout=5)
+        return [t.strip() for t in p.stdout.splitlines() if t.strip()] if p.returncode == 0 else []
+
+    def get(self) -> str:
+        """The clipboard as text ("" if it holds no text)."""
+        b = self._backend()
+        if b == "wl":
+            p = subprocess.run(["wl-paste", "-n", "-t", "text"], capture_output=True, timeout=5)
+            return p.stdout.decode("utf-8", errors="replace") if p.returncode == 0 else ""
+        if b == "klipper":
+            return _klipper("getClipboardContents") or ""
+        p = subprocess.run(["xclip", "-o", "-sel", "clip"], capture_output=True, timeout=5)
+        return p.stdout.decode("utf-8", errors="replace") if p.returncode == 0 else ""
+
     def set(self, text: str) -> None:
-        if shutil.which("wl-copy"):
+        b = self._backend()
+        if b == "wl":
             # wl-copy forks a server that keeps the pipes open; don't capture its output.
-            subprocess.run(["wl-copy", "--", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-        elif shutil.which("qdbus6"):
-            _run(["qdbus6", "org.kde.klipper", "/klipper", "setClipboardContents", text])
-        elif shutil.which("xclip"):
-            subprocess.run(["xclip", "-sel", "clip"], input=text, text=True, timeout=5)
+            subprocess.run(["wl-copy"], input=text.encode("utf-8"), stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5, check=True)
+        elif b == "klipper":
+            _klipper("setClipboardContents", text)
         else:
-            raise RuntimeError("no clipboard tool: install wl-clipboard")
+            subprocess.run(["xclip", "-sel", "clip"], input=text.encode("utf-8"), timeout=5, check=True)
+
+    def clear(self) -> None:
+        b = self._backend()
+        if b == "wl":
+            subprocess.run(["wl-copy", "--clear"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        elif b == "klipper":
+            _klipper("clearClipboardContents")
+        else:
+            self.set("")
+
+    def snapshot(self) -> Snapshot | None:
+        """Save the clipboard so it can be put back; None = don't touch it afterwards
+        (a password-manager secret, or something kivi can't read faithfully)."""
+        b = self._backend()
+        if b != "wl":
+            text = self.get()
+            return Snapshot("text/plain;charset=utf-8", text.encode("utf-8")) if text else None
+        types = self.types()
+        if not types:
+            return Snapshot(None)
+        if PASSWORD_HINT in types:
+            return None
+        mime = next((t for t in types if t == "text/uri-list"), None)       # copied files
+        mime = mime or next((t for t in types if t.startswith("image/")), None)
+        mime = mime or next((t for t in _TEXT_TYPES if t in types), None)
+        mime = mime or next((t for t in types if "/" in t), None)
+        if mime is None:
+            return None
+        p = subprocess.run(["wl-paste", "-n", "-t", mime], capture_output=True, timeout=5)
+        if p.returncode != 0 or len(p.stdout) > _SNAPSHOT_LIMIT:
+            return None
+        return Snapshot(mime, p.stdout)
+
+    def restore(self, snap: Snapshot) -> None:
+        if snap.mime is None:
+            self.clear()
+        elif snap.mime in _TEXT_TYPES or self._backend() != "wl":
+            self.set(snap.data.decode("utf-8", errors="replace"))  # wl-copy offers all text aliases
+        else:
+            subprocess.run(["wl-copy", "-t", snap.mime], input=snap.data, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5, check=True)
 
     def safe_get(self) -> str | None:
         try:
             return self.get()
         except Exception:
             return None
+
+    def safe_snapshot(self) -> Snapshot | None:
+        try:
+            return self.snapshot()
+        except Exception:
+            return None
+
+    def safe_restore(self, snap: Snapshot) -> None:
+        try:
+            self.restore(snap)
+        except Exception as e:
+            print(f"kivi: couldn't restore the clipboard: {e}")
 
 
 # ---------------------------------------------------------------- virtual keyboard
@@ -98,33 +209,71 @@ class Keyboard:
         self._ui.close()
 
 
-def insert_text(kbd, clip, text, paste_keys="ctrl+v", restore=True) -> None:
-    """Paste `text` into the focused app via the clipboard, then put the old clipboard back."""
-    old = clip.safe_get() if restore else None
+class TypingError(RuntimeError):
+    """The text is on the clipboard but kivi couldn't press the paste keys."""
+
+
+def _keyboard(kbd):
+    return kbd() if callable(kbd) and not hasattr(kbd, "combo") else kbd
+
+
+def _why(e):
+    msg = str(e)
+    if "uinput" in msg.lower() or isinstance(e, PermissionError):
+        return "no /dev/uinput access"
+    return msg[:120] or e.__class__.__name__
+
+
+def insert_text(kbd, clip, text, paste_keys="ctrl+v", restore=True, restore_delay=0.6) -> None:
+    """Paste `text` into the focused app via the clipboard, then put the old clipboard back.
+
+    `kbd` is a Keyboard or a function returning one; it is only created after the text is
+    on the clipboard, so a missing /dev/uinput still leaves the text ready to paste by hand.
+    """
+    snap = clip.safe_snapshot() if restore else None
     clip.set(text)
-    time.sleep(0.05)
-    kbd.combo(paste_keys)
-    if restore and old is not None:
-        time.sleep(0.4)  # let the target app read the clipboard first
-        clip.set(old)
+    try:
+        keyboard = _keyboard(kbd)
+        time.sleep(0.05)
+        keyboard.combo(paste_keys)
+    except Exception as e:
+        raise TypingError(f"copied — press {paste_keys.replace('+', ' + ')} "
+                          f"(kivi can't type: {_why(e)})") from e
+    if snap is not None:
+        time.sleep(max(0.1, float(restore_delay)))  # let the target app read the clipboard first
+        if clip.safe_get() == text:  # skip if the user (or app) copied something new meanwhile
+            clip.safe_restore(snap)
 
 
-def selected_text(kbd, clip) -> str:
-    """Copy the current selection with ctrl+c and return it ("" if nothing is selected).
+def selected_text(kbd, clip, copy_keys="ctrl+c", wait=0.8) -> str:
+    """Copy the current selection with `copy_keys` and return it ("" if nothing is selected).
 
     The user's clipboard is restored afterwards, so a following insert_text() saves and
     restores the real clipboard rather than the selection.
     """
-    old = clip.safe_get()
+    snap = clip.safe_snapshot()
     sentinel = f"kivi-{uuid.uuid4().hex}"
     clip.set(sentinel)
-    time.sleep(0.05)
-    kbd.combo("ctrl+c")
-    time.sleep(0.25)
-    text = clip.safe_get() or ""
-    if old is not None:
-        clip.set(old)
-    return "" if text == sentinel else text
+    text = None
+    try:
+        keyboard = _keyboard(kbd)
+        time.sleep(0.05)
+        keyboard.combo(copy_keys)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:  # slow apps (big browser pages) copy late
+            time.sleep(0.05)
+            text = clip.safe_get()
+            if text is not None and text != sentinel:
+                break
+    finally:
+        if snap is not None:
+            clip.safe_restore(snap)
+        elif clip.safe_get() == sentinel:
+            try:
+                clip.clear()
+            except Exception:
+                pass
+    return "" if text is None or text == sentinel else text
 
 
 # ---------------------------------------------------------------- notifications
@@ -137,7 +286,7 @@ def notify(summary, body="", timeout_ms=2500) -> None:
     if not shutil.which("notify-send"):
         return
     cmd = ["notify-send", "-a", "kivi", "-i", "kivi", "-p", "-t", str(timeout_ms),
-           "-h", "string:x-kde-origin-name:kivi"]
+           "-h", "string:x-kde-origin-name:kivi", "-h", "boolean:transient:true"]
     if _notify_id:
         cmd += ["-r", _notify_id]
     try:
@@ -149,11 +298,27 @@ def notify(summary, body="", timeout_ms=2500) -> None:
 
 # ---------------------------------------------------------------- launching
 
-def open_url(url) -> None:
-    url = url.strip()
-    if "://" not in url and not url.startswith(("mailto:", "file:")):
+ALLOWED_URL_SCHEMES = ("http", "https", "mailto")
+
+
+def safe_url(url) -> str:
+    """Normalise a URL and refuse anything but http(s) and mailto (no file:, smb:, custom handlers)."""
+    url = (url or "").strip()
+    if not url or any(ord(c) < 32 for c in url):
+        raise ValueError("not a valid link")
+    if "://" not in url and not url.lower().startswith("mailto:"):
         url = "https://" + url
-    _spawn(["xdg-open", url])
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ALLOWED_URL_SCHEMES:
+        raise ValueError(f"kivi only opens http, https and mailto links (not {scheme or '?'}:)")
+    if scheme in ("http", "https") and not parts.netloc:
+        raise ValueError("that link has no host")
+    return url
+
+
+def open_url(url) -> None:
+    _spawn(["xdg-open", safe_url(url)])
 
 
 def _application_dirs():
@@ -226,10 +391,7 @@ def launch_app(name) -> bool:
             else:
                 return False
             return True
-        exe = shutil.which(name.strip().lower())
-        if exe:
-            _spawn([exe])
-            return True
+        # No PATH/absolute-path fallback on purpose: only installed desktop apps can be launched.
     except OSError:
         pass
     return False
