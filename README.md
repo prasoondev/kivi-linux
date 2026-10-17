@@ -2,10 +2,15 @@
 
 you talk. kivi types.
 
-A Linux take on [heykivi.ai](https://heykivi.ai), powered by [Sarvam AI](https://sarvam.ai). Hold a key,
-speak, let go, and clean text lands in whatever app has focus. It works in Hindi, Hinglish, English and
-the other Indian languages `saaras:v4` understands. A small pill sits on your desktop and shows you
-what kivi is doing. It also hosts a voice agent that can open things and type for you.
+[Kivi](https://heykivi.ai) isn't available for Linux, so this tries to mirror it, powered by
+[Sarvam AI](https://sarvam.ai). Hold a key, speak, let go, and clean text lands in whatever app has
+focus. It works in Hindi, Hinglish, English and the other Indian languages `saaras:v4` understands.
+A small pill sits on your desktop and shows you what kivi is doing. It also hosts a voice agent that
+can open things and type for you.
+
+<p align="center">
+  <img src="docs/screenshots/settings-home.png" width="720" alt="kivi settings app, home page">
+</p>
 
 ## what it does
 
@@ -24,6 +29,62 @@ what kivi is doing. It also hosts a voice agent that can open things and type fo
 - **history**: every run is saved locally so you can copy it again later.
 
 All of these can be changed in **kivi settings** (app menu → kivi).
+
+## ui
+
+The look follows Kivi's: the dark "dusk" palette (`#0b0e0a` background, cream `#f4f1e6` text), the
+green `#a8e063` listening bars, **Fraunces** for headings, **Switzer** for body text, and lowercase
+copy throughout.
+
+### the pill
+
+kivi's always-on face. It sits at the bottom centre of your screen, above every window, and never takes
+keyboard focus, so your text still lands in the app you were using. On KDE it uses `gtk4-layer-shell`,
+and falls back to a KWin script if that isn't installed.
+
+<p align="center">
+  <img src="docs/screenshots/pill-states.png" width="480" alt="pill states: idle, listening, thinking, you said, done, error">
+</p>
+
+From top to bottom: **idle** (a small dim pill), **listening** (the bars move with your voice, with a
+timer), **thinking**, **you said** (the raw transcript), **done** (the cleaned text that was typed),
+and **error**.
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/pill-reply.png" alt="agent reply card"></td>
+    <td><img src="docs/screenshots/pill-menu.png" width="300" alt="pill right-click menu"></td>
+  </tr>
+  <tr>
+    <td>The agent and ask mode answer in a card above the pill, with copy and dismiss. With
+    <code>agent_speak</code> on, kivi also reads the answer aloud in a Bulbul v3 voice.</td>
+    <td>Right-click the pill for settings, pause, hide and quit.</td>
+  </tr>
+</table>
+
+### kivi settings
+
+A GTK4 / libadwaita app for managing kivi. There's no sign-in: you paste your own Sarvam API key and
+it stays on your machine.
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/settings-home.png" alt="home"><br><b>home</b>: whether kivi is running, start/stop, launch at login, and a setup checklist that gives the exact command for anything missing.</td>
+    <td><img src="docs/screenshots/settings-api-key.png" alt="api key"><br><b>api key</b>: paste and test your Sarvam key, in place of signing in.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/settings-shortcuts.png" alt="shortcuts"><br><b>shortcuts</b>: press the keys you want to record a new shortcut. Also hands-free, hold time and the paste key.</td>
+    <td><img src="docs/screenshots/settings-voice.png" alt="voice and language"><br><b>voice & language</b>: auto-detect or pick from 23 languages, polishing on/off, and the agent's voice, with a preview.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/settings-style.png" alt="style"><br><b>style</b>: describe how you write in plain words, or start from the developer, messaging or productivity persona.</td>
+    <td><img src="docs/screenshots/settings-memory.png" alt="memory"><br><b>memory</b>: "kivi remembered", the names and jargon kivi now spells right.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/settings-history.png" alt="history"><br><b>history</b>: what you said next to what kivi did with it, kept only on your machine.</td>
+    <td><img src="docs/screenshots/settings-agent.png" alt="agent"><br><b>agent</b>: what the voice agent can do, an opt-in switch for shell commands, and pill placement.</td>
+  </tr>
+</table>
 
 ## install
 
