@@ -29,6 +29,26 @@ in plain text without markdown, in the user's language."""
 _NON_LATIN = re.compile(r"[^\x00-ɏ -⁯]")
 
 
+_INDIC = re.compile(r"[\u0900-\u0dff]")  # Indic scripts (Devanagari .. Sinhala)
+
+
+def cleanup(cfg: dict, text: str, words=()) -> str:
+    """Dictation cleanup (filler removal, punctuation). Falls back to the raw text if the model
+    changed script, i.e. translated instead of cleaning (seen occasionally with English input)."""
+    if not cfg.get("cleanup", True) or not text.strip():
+        return text
+    system = CLEANUP_PROMPT
+    if words:
+        system += "\n\nCorrect spellings for names/terms the user uses (prefer these): " + ", ".join(words)
+    if cfg.get("style"):
+        system += "\n\nUser's preferred style: " + cfg["style"]
+    out = sarvam.complete(cfg["api_key"], cfg.get("cleanup_model", "sarvam-105b-conversations"),
+                          system, text) or text
+    if bool(_INDIC.search(out)) != bool(_INDIC.search(text)):
+        return text
+    return out
+
+
 class Engine:
     def __init__(self, cfg: dict, ui: Callable[[str, dict], None]):
         self.cfg = cfg
@@ -147,38 +167,22 @@ class Engine:
                 pass
 
     def _dictate(self, cfg, heard, words):
-        text = heard
-        if cfg.get("cleanup", True):
-            system = CLEANUP_PROMPT
-            if words:
-                system += "\n\nCorrect spellings for names/terms the user uses (prefer these): " + ", ".join(words)
-            if cfg.get("style"):
-                system += "\n\nUser's preferred style: " + cfg["style"]
-            text = sarvam.complete(cfg["api_key"], cfg.get("cleanup_model", "sarvam-105b-conversations"),
-                                   system, heard) or heard
+        text = cleanup(cfg, heard, words)
         desktop.insert_text(self.ctx.kbd, self.ctx.clip, text, cfg.get("paste_keys", "ctrl+v"),
                             cfg.get("restore_clipboard", True))
         return text
 
     def _command(self, cfg, heard):
         """Rewrite the selection if there is one, else answer the question. Returns (result, reply|None)."""
-        clip, model = self.ctx.clip, cfg.get("command_model", "sarvam-105b")
-        try:
-            old = clip.get()
-        except Exception:
-            old = None
-        selection = desktop.selected_text(self.ctx.kbd, clip)
+        model = cfg.get("command_model", "sarvam-105b")
+        # selected_text() puts the user's clipboard back itself, so insert_text can save/restore it normally
+        selection = desktop.selected_text(self.ctx.kbd, self.ctx.clip)
         if selection:
             out = sarvam.complete(cfg["api_key"], model, COMMAND_PROMPT,
                                   f"SELECTED TEXT:\n{selection}\n\nINSTRUCTION:\n{heard}")
-            # paste without insert_text's own restore: the clipboard now holds the selection, not the user's
-            desktop.insert_text(self.ctx.kbd, clip, out, cfg.get("paste_keys", "ctrl+v"), restore=False)
-            if cfg.get("restore_clipboard", True) and old is not None:
-                time.sleep(0.4)
-                clip.set(old)
+            desktop.insert_text(self.ctx.kbd, self.ctx.clip, out, cfg.get("paste_keys", "ctrl+v"),
+                                cfg.get("restore_clipboard", True))
             return out, None
-        if old is not None:
-            clip.set(old)  # undo the selection probe's sentinel
         answer = sarvam.complete(cfg["api_key"], model, ASK_PROMPT, heard)
         return answer, answer
 

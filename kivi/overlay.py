@@ -301,13 +301,11 @@ class Overlay:
         self._card = None
         self._items = []
 
-        now = time.monotonic()
         self._w, self._h = Tween(46, 380), Tween(16, 380)
         self._alpha = Tween(1.0, 220)
         self._content = Tween(1.0, 260)
         self._glow = Tween(0.0, 400)
         self._card_a = Tween(0.0, 260)
-        self._now = now
 
         self._load_cfg(cfg)
         theme.apply(theme.OVERLAY_CSS)
@@ -428,7 +426,6 @@ class Overlay:
 
         self._apply_position()
         win.connect("realize", lambda w: GLib.idle_add(self._update_region))
-        win.connect("notify::is-active", lambda *_: self._update_region())
 
     def _apply_position(self):
         for card in (self.reply_card, self.menu_card):
@@ -472,7 +469,7 @@ class Overlay:
         card.append(head)
 
         self.answer = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR,
-                                max_width_chars=40, lines=9, ellipsize=Pango.EllipsizeMode.END)
+                                max_width_chars=38, lines=9, ellipsize=Pango.EllipsizeMode.END)
         self.answer.add_css_class("kivi-answer")
         self.answer.set_size_request(-1, -1)
         card.append(self.answer)
@@ -581,7 +578,7 @@ class Overlay:
         if hover != self._hover:
             self._hover = hover
             if self.state == "idle":
-                self._later("hover", 0 if not hover else 120, self._set_state, "idle", {}, True)
+                self._later("hover", 0 if not hover else 120, self._set_state, "idle", {})
 
     def _on_pill_click(self, gesture, n, x, y):
         if not self._in_pill(x, y) or self._alpha.target == 0:
@@ -1054,7 +1051,8 @@ def _demo(argv):
         os.environ["KIVI_OVERLAY_BACKEND"] = "kwin"
 
     app = Gtk.Application(application_id="ai.kivi.Linux.OverlayDemo", flags=Gio.ApplicationFlags.NON_UNIQUE)
-    cfg = {"overlay": {"enabled": True, "position": "bottom", "idle": "pill", "margin": 28},
+    cfg = {"overlay": {"enabled": True, "position": "top" if "--top" in argv else "bottom", "idle": "pill",
+                       "margin": 28},
            "shortcuts": {"dictate": "RIGHTCTRL"}}
     state = {"ov": None, "level_src": None, "t": 0.0}
 
@@ -1119,8 +1117,14 @@ def _demo(argv):
             GLib.timeout_add(int(float(argv[argv.index("--seconds") + 1]) * 1000), app.quit)
 
     app.connect("activate", activate)
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, lambda: (app.quit(), False)[1])
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 2, lambda: (app.quit(), False)[1])
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        add_signal = GLibUnix.signal_add
+    except (ValueError, ImportError):
+        add_signal = GLib.unix_signal_add
+    for sig in (2, 15):
+        add_signal(GLib.PRIORITY_DEFAULT, sig, lambda: (app.quit(), False)[1])
     app.run([sys.argv[0]])
 
 
@@ -1128,4 +1132,4 @@ if __name__ == "__main__":
     if "--demo" in sys.argv[1:]:
         _demo(sys.argv[1:])
     else:
-        print("usage: python3 -m kivi.overlay --demo [--state NAME] [--no-layer-shell] [--seconds N]")
+        print("usage: python3 -m kivi.overlay --demo [--state NAME] [--top] [--no-layer-shell] [--seconds N]")

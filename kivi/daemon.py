@@ -119,7 +119,8 @@ class Daemon:
             self.server = None
             log.error("ipc socket unavailable (kivi toggle/status won't work): %s", ex)
 
-        log.info("kivi is running (pill: %s)", "layer-shell" if self._layer_shell() else "fallback window")
+        log.info("kivi is running (pill: %s, hotkeys: %s)", getattr(self.overlay, "backend", "none"),
+                 "on" if self.listener is not None and self.input_ok else "off")
         self._push_status()
         if not self.cfg.get("api_key"):
             self._ui("error", {"message": "no sarvam api key yet. open kivi settings → api key."})
@@ -150,6 +151,8 @@ class Daemon:
             stop_playback()
         except Exception:
             pass
+        if self.notifier.id:  # don't leave a stale "listening…" bubble behind
+            self.notifier.show("kivi", "stopped", 1)
         log.info("kivi stopped")
 
     def _on_signal(self, sig):
@@ -191,7 +194,7 @@ class Daemon:
                 self.overlay.handle(event, data)
             except Exception as ex:
                 log.error("overlay: %s", ex)
-        if not self._overlay_live() or self.cfg.get("notify"):
+        if not self._overlay_live() or not getattr(self.overlay, "available", True) or self.cfg.get("notify"):
             self._notify(event, data)
 
     def _notify(self, event, data):
@@ -308,6 +311,8 @@ class Daemon:
         return False
 
     def _layer_shell(self):
+        if self.overlay is not None and hasattr(self.overlay, "backend"):
+            return self.overlay.backend == "layer-shell"
         from kivi import desktop
         return desktop.layer_shell_available() and LAYER_SHELL_LIB in os.environ.get("LD_PRELOAD", "")
 
