@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=kivi
+GenericName=Voice Dictation
+Comment=you talk. kivi types.
+Exec=kivi settings
+Icon=kivi
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=voice;dictation;speech;transcribe;assistant;sarvam;
+StartupNotify=true
+StartupWMClass=ai.kivi.Linux

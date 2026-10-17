@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- original kivi-linux mark: five level bars on a dark tile, snapped to a 16 px grid -->
+  <rect width="512" height="512" rx="112" fill="#0b0e0a"/>
+  <g fill="#a8e063">
+    <rect x="32" y="192" width="64" height="128" rx="32"/>
+    <rect x="128" y="96" width="64" height="320" rx="32"/>
+    <rect x="224" y="160" width="64" height="192" rx="32"/>
+    <rect x="320" y="64" width="64" height="384" rx="32"/>
+    <rect x="416" y="128" width="64" height="256" rx="32"/>
+  </g>
+</svg>

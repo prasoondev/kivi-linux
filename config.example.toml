@@ -1,0 +1,33 @@
+# ~/.config/kivi/config.toml. every key is optional; `kivi settings` edits this file for you.
+# the sarvam api key lives in ~/.config/kivi/api_key (chmod 600) or $SARVAM_API_KEY, never here.
+
+language = "unknown"            # auto-detect, or "hi-IN", "en-IN", "ta-IN", ...
+stt_model = "saaras:v4"
+cleanup = true                  # remove filler words, fix punctuation, apply self-corrections
+cleanup_model = "sarvam-105b-conversations"
+command_model = "sarvam-105b"
+agent_model = "sarvam-105b-conversations"
+style = ""                      # persona, e.g. "casual, all lowercase, no full stops"
+
+paste_keys = "ctrl+v"           # "ctrl+shift+v" if you mostly dictate into terminals
+restore_clipboard = true
+min_hold = 0.35                 # shorter taps are ignored, so normal right ctrl use keeps working
+hands_free = true               # double-tap the dictate shortcut to keep listening until the next tap
+history = true                  # keep past dictations in ~/.local/share/kivi/history.jsonl
+notify = false                  # also show desktop notifications (they're used anyway if the pill can't)
+
+agent_speak = true              # speak agent replies out loud
+tts_speaker = "shubh"
+tts_language = "en-IN"
+agent_allow_shell = false       # let the agent run shell commands (careful)
+
+[shortcuts]                     # hold-combos of evdev key names (see `evtest`), joined by "+"
+dictate = "RIGHTCTRL"
+command = "RIGHTCTRL+RIGHTSHIFT"
+agent = "RIGHTALT"
+
+[overlay]
+enabled = true
+position = "bottom"             # "bottom" | "top"
+idle = "pill"                   # "pill" (small pill always visible) | "hidden"
+margin = 28
